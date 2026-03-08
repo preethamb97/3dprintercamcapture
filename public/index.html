@@ -39,6 +39,8 @@
     .status .mqtt.on { color: var(--accent); }
     .status .mqtt.off { color: var(--error); }
     .status .layer { margin-top: 0.5rem; color: var(--muted); }
+    .status .counts { margin-top: 0.25rem; font-size: 0.8rem; color: var(--muted); }
+    .status .counts .miss { color: var(--error); }
     .preview-wrap {
       position: relative;
       width: 100%;
@@ -114,6 +116,7 @@
   <div class="status">
     <span class="mqtt off" id="mqttStatus">Connecting…</span>
     <div class="layer" id="lastLayer">Last capture: —</div>
+    <div class="counts">Saved: <span id="savedCount">0</span> &nbsp;|&nbsp; <span class="miss" id="missedCount" style="display:none">Missed: <span id="missedNum">0</span></span></div>
   </div>
   <p class="mobile-url" id="mobileUrl"></p>
   <div class="error" id="camError" style="display: none;"></div>
@@ -142,6 +145,28 @@
     const camError = document.getElementById('camError');
     const cameraSelect = document.getElementById('cameraSelect');
     const qualitySelect = document.getElementById('qualitySelect');
+    const savedCountEl = document.getElementById('savedCount');
+    const missedCountEl = document.getElementById('missedCount');
+    const missedNumEl = document.getElementById('missedNum');
+
+    let savedCount = 0;
+    let missedCount = 0;
+    let wakeLock = null;
+
+    // Screen Wake Lock – prevent the phone screen/tab from sleeping so the camera stays alive.
+    async function acquireWakeLock() {
+      if (!('wakeLock' in navigator)) return;
+      try {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => {
+          // Reacquire when page becomes visible again (e.g. after tab switch)
+          if (!document.hidden) acquireWakeLock();
+        });
+      } catch (_) {}
+    }
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) acquireWakeLock();
+    });
 
     function getVideoConstraints() {
       const quality = qualitySelect.value;
@@ -220,16 +245,62 @@
       captureFrame(layer);
     });
 
-    function captureFrame(layerNum) {
-      if (!video.srcObject || video.readyState < 2) return;
-      const w = video.videoWidth;
-      const h = video.videoHeight;
-      if (!w || !h) return;
-      canvas.width = w;
-      canvas.height = h;
+    // Attempt to capture with retries in case the video isn't ready yet (readyState < 2).
+    // Also handles the case where the tab was backgrounded and the camera frame is stale.
+    function captureFrame(layerNum, attempt) {
+      if (attempt === undefined) attempt = 0;
+      const MAX_RETRIES = 8;
+      const RETRY_DELAY = 400; // ms
+
+      if (!video.srcObject) {
+        console.warn(`[Capture] Layer ${layerNum}: no camera stream (attempt ${attempt})`);
+        if (attempt < MAX_RETRIES) {
+          setTimeout(() => captureFrame(layerNum, attempt + 1), RETRY_DELAY);
+        } else {
+          bumpMissed(layerNum, 'no stream after retries');
+        }
+        return;
+      }
+
+      if (video.readyState < 2 || !video.videoWidth || !video.videoHeight) {
+        if (attempt < MAX_RETRIES) {
+          setTimeout(() => captureFrame(layerNum, attempt + 1), RETRY_DELAY);
+        } else {
+          bumpMissed(layerNum, 'video not ready after retries');
+        }
+        return;
+      }
+
+      canvas.width = video.videoWidth;
+      canvas.height = video.videoHeight;
       ctx.drawImage(video, 0, 0);
       const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
-      socket.emit('save_photo', { layer: layerNum, dataUrl });
+
+      // Sanity check: a blank/empty frame produces a very short data URL
+      if (dataUrl.length < 5000) {
+        if (attempt < MAX_RETRIES) {
+          setTimeout(() => captureFrame(layerNum, attempt + 1), RETRY_DELAY);
+        } else {
+          bumpMissed(layerNum, 'blank frame after retries');
+        }
+        return;
+      }
+
+      socket.emit('save_photo', { layer: layerNum, dataUrl }, (ack) => {
+        if (ack && ack.ok) {
+          savedCount++;
+          savedCountEl.textContent = savedCount;
+        } else {
+          bumpMissed(layerNum, ack ? ack.msg : 'no ack from server');
+        }
+      });
+    }
+
+    function bumpMissed(layerNum, reason) {
+      missedCount++;
+      missedNumEl.textContent = missedCount;
+      missedCountEl.style.display = '';
+      console.warn(`[Capture] Layer ${layerNum} MISSED: ${reason}`);
     }
 
     async function startCamera() {
@@ -266,6 +337,7 @@
     qualitySelect.addEventListener('change', startCamera);
 
     startCamera();
+    acquireWakeLock();
   </script>
 </body>
 </html>

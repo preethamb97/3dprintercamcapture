@@ -1,0 +1,11 @@
+; layer num/total_layer_count: {layer_num+1}/[total_layer_count]
+; update layer progress
+M73 L{layer_num+1}
+M991 S0 P{layer_num} ;notify layer change
+
+; --- Custom Wait After Layer ---
+M400 ; Wait for all printing moves to finish
+G1 X5 Y250 F9000 ; Move toolhead to front-left and push bed forward
+M400 ; Wait for the travel move to complete
+G4 S3 ; Pause for 3 seconds
+; -------------------------------
