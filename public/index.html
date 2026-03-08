@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bambu A1 Time-Lapse Capture</title>
+  <script src="/socket.io/socket.io.js"></script>
+  <style>
+    * { box-sizing: border-box; }
+    :root {
+      --bg: #0f0f12;
+      --surface: #1a1a20;
+      --text: #e8e8ec;
+      --muted: #888;
+      --accent: #00c853;
+      --error: #ff5252;
+    }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      padding: 1rem;
+    }
+    h1 {
+      font-size: 1.25rem;
+      font-weight: 600;
+      margin: 0 0 1rem;
+    }
+    .status {
+      padding: 0.75rem 1rem;
+      background: var(--surface);
+      border-radius: 8px;
+      margin-bottom: 1rem;
+      font-size: 0.9rem;
+    }
+    .status .mqtt { color: var(--muted); }
+    .status .mqtt.on { color: var(--accent); }
+    .status .mqtt.off { color: var(--error); }
+    .status .layer { margin-top: 0.5rem; color: var(--muted); }
+    .preview-wrap {
+      position: relative;
+      width: 100%;
+      max-width: 480px;
+      margin: 0 auto 1rem;
+      border-radius: 12px;
+      overflow: hidden;
+      background: #000;
+      aspect-ratio: 4/3;
+    }
+    .preview-wrap video {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      display: block;
+    }
+    .preview-wrap .overlay {
+      position: absolute;
+      bottom: 0;
+      left: 0;
+      right: 0;
+      padding: 0.5rem 0.75rem;
+      background: linear-gradient(transparent, rgba(0,0,0,0.7));
+      font-size: 0.85rem;
+      color: rgba(255,255,255,0.9);
+    }
+    canvas { display: none; }
+    .error {
+      color: var(--error);
+      padding: 0.75rem;
+      background: rgba(255,82,82,0.1);
+      border-radius: 8px;
+      margin-bottom: 1rem;
+    }
+    .mobile-url {
+      font-size: 0.8rem;
+      color: var(--muted);
+      margin: 0 0 1rem;
+      word-break: break-all;
+    }
+    .settings {
+      background: var(--surface);
+      border-radius: 8px;
+      padding: 1rem;
+      margin-bottom: 1rem;
+    }
+    .settings h2 {
+      font-size: 0.9rem;
+      font-weight: 600;
+      margin: 0 0 0.75rem;
+      color: var(--muted);
+    }
+    .settings label {
+      display: block;
+      font-size: 0.85rem;
+      margin-bottom: 0.25rem;
+    }
+    .settings select {
+      width: 100%;
+      max-width: 320px;
+      padding: 0.5rem 0.75rem;
+      margin-bottom: 0.75rem;
+      font-size: 0.9rem;
+      background: var(--bg);
+      border: 1px solid #333;
+      border-radius: 6px;
+      color: var(--text);
+    }
+  </style>
+</head>
+<body>
+  <h1>Bambu A1 Time-Lapse</h1>
+  <div class="status">
+    <span class="mqtt off" id="mqttStatus">Connecting…</span>
+    <div class="layer" id="lastLayer">Last capture: —</div>
+  </div>
+  <p class="mobile-url" id="mobileUrl"></p>
+  <div class="error" id="camError" style="display: none;"></div>
+  <div class="settings">
+    <h2>Camera</h2>
+    <label for="cameraSelect">Camera</label>
+    <select id="cameraSelect" aria-label="Choose camera"></select>
+    <label for="qualitySelect">Quality</label>
+    <select id="qualitySelect" aria-label="Choose quality">
+      <option value="hd">HD (1080p)</option>
+      <option value="max">Max (camera max)</option>
+    </select>
+  </div>
+  <div class="preview-wrap">
+    <video id="video" autoplay playsinline muted></video>
+    <div class="overlay">Live camera – photos save to server only</div>
+  </div>
+  <canvas id="canvas"></canvas>
+
+  <script>
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const mqttStatus = document.getElementById('mqttStatus');
+    const lastLayerEl = document.getElementById('lastLayer');
+    const camError = document.getElementById('camError');
+    const cameraSelect = document.getElementById('cameraSelect');
+    const qualitySelect = document.getElementById('qualitySelect');
+
+    function getVideoConstraints() {
+      const quality = qualitySelect.value;
+      const base = {};
+      if (cameraSelect.value) {
+        base.deviceId = { exact: cameraSelect.value };
+      } else {
+        base.facingMode = { ideal: 'environment' }; // default: back/rear camera
+      }
+      if (quality === 'max') {
+        base.width = { ideal: 4096 };
+        base.height = { ideal: 2160 };
+      } else {
+        base.width = { ideal: 1920 };
+        base.height = { ideal: 1080 };
+      }
+      return base;
+    }
+
+    function stopCamera() {
+      if (video.srcObject) {
+        video.srcObject.getTracks().forEach(t => t.stop());
+        video.srcObject = null;
+      }
+    }
+
+    async function enumerateCameras() {
+      if (!navigator.mediaDevices?.enumerateDevices) return;
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoInputs = devices.filter(d => d.kind === 'videoinput');
+      cameraSelect.innerHTML = '';
+      videoInputs.forEach((d, i) => {
+        const opt = document.createElement('option');
+        opt.value = d.deviceId;
+        opt.textContent = d.label || ('Camera ' + (i + 1));
+        cameraSelect.appendChild(opt);
+      });
+    }
+
+    function selectBackCameraDefault() {
+      const opts = cameraSelect.options;
+      const backKeywords = /back|rear|environment|external/i;
+      for (let i = 0; i < opts.length; i++) {
+        if (backKeywords.test(opts[i].text)) {
+          cameraSelect.selectedIndex = i;
+          return;
+        }
+      }
+    }
+
+    // Connect to same host that served this page (works when opened on phone at http://PC_IP:3000)
+    const socket = io({ transports: ['websocket', 'polling'] });
+
+    fetch('/api/config').then(r => r.json()).then(({ baseUrl }) => {
+      const el = document.getElementById('mobileUrl');
+      if (baseUrl && el) el.textContent = 'On your phone, open: ' + baseUrl;
+    }).catch(() => {});
+
+    socket.on('connect', () => {
+      mqttStatus.textContent = 'Waiting for printer (MQTT)…';
+      mqttStatus.className = 'mqtt off';
+    });
+    socket.on('disconnect', () => {
+      mqttStatus.textContent = 'Server disconnected';
+      mqttStatus.className = 'mqtt off';
+    });
+    socket.on('status', (data) => {
+      mqttStatus.textContent = data.message || (data.mqtt ? 'MQTT connected' : 'MQTT disconnected');
+      mqttStatus.className = 'mqtt ' + (data.mqtt ? 'on' : 'off');
+    });
+    socket.on('capture_frame', (data) => {
+      const layer = data.layer;
+      mqttStatus.className = 'mqtt on';
+      mqttStatus.textContent = 'MQTT connected – capturing layer ' + layer;
+      lastLayerEl.textContent = 'Last capture: layer ' + layer;
+      captureFrame(layer);
+    });
+
+    function captureFrame(layerNum) {
+      if (!video.srcObject || video.readyState < 2) return;
+      const w = video.videoWidth;
+      const h = video.videoHeight;
+      if (!w || !h) return;
+      canvas.width = w;
+      canvas.height = h;
+      ctx.drawImage(video, 0, 0);
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.92);
+      socket.emit('save_photo', { layer: layerNum, dataUrl });
+    }
+
+    async function startCamera() {
+      camError.style.display = 'none';
+      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+        camError.textContent = 'Camera needs a secure connection (HTTPS). Open the https:// URL above and accept the certificate.';
+        camError.style.display = 'block';
+        return;
+      }
+      stopCamera();
+      try {
+        const constraints = {
+          video: getVideoConstraints(),
+          audio: false
+        };
+        const stream = await navigator.mediaDevices.getUserMedia(constraints);
+        video.srcObject = stream;
+        await enumerateCameras();
+        const activeId = stream.getVideoTracks()[0]?.getSettings?.()?.deviceId;
+        if (activeId) {
+          const opt = Array.from(cameraSelect.options).find(o => o.value === activeId);
+          if (opt) cameraSelect.value = activeId;
+        } else {
+          selectBackCameraDefault();
+        }
+        if (!cameraSelect.value && cameraSelect.options.length) cameraSelect.selectedIndex = 0;
+      } catch (e) {
+        camError.textContent = 'Camera error: ' + (e.message || 'Permission denied');
+        camError.style.display = 'block';
+      }
+    }
+
+    cameraSelect.addEventListener('change', startCamera);
+    qualitySelect.addEventListener('change', startCamera);
+
+    startCamera();
+  </script>
+</body>
+</html>
